@@ -17,17 +17,31 @@ public class BalanceEngine {
     private final MqttPublisher mqttPublisher;
     private final DashboardWebSocketHandler wsHandler;
 
-    @Value("${balance.high-threshold}")
+    @Value("${balance.high-threshold:450}")
     private int highThreshold;
 
-    @Value("${balance.low-threshold}")
+    @Value("${balance.low-threshold:150}")
     private int lowThreshold;
 
-    @Value("${balance.diff-threshold}")
+    @Value("${balance.diff-threshold:200}")
     private int diffThreshold;
+
+    @Value("${balance.min-action-interval-ms:10000}")
+    private long minActionIntervalMs;
+
+    @Value("${balance.stable-count:3}")
+    private int stableCountRequired;
 
     private final Map<String, Boolean> valveStates = new HashMap<>();
     private final Map<Integer, Boolean> pumpStates = new HashMap<>();
+
+    private final Map<String, Long> lastValveActionTime = new HashMap<>();
+    private final Map<Integer, Long> lastPumpActionTime = new HashMap<>();
+
+    private final Map<String, Integer> valveOpenStreak = new HashMap<>();
+    private final Map<String, Integer> valveCloseStreak = new HashMap<>();
+    private final Map<Integer, Integer> pumpOnStreak = new HashMap<>();
+    private final Map<Integer, Integer> pumpOffStreak = new HashMap<>();
 
     public BalanceEngine(MqttPublisher mqttPublisher, DashboardWebSocketHandler wsHandler) {
         this.mqttPublisher = mqttPublisher;
@@ -43,10 +57,11 @@ public class BalanceEngine {
 
     public void evaluate(Map<Integer, Integer> levels) {
         List<Map<String, Object>> actions = new ArrayList<>();
+        long now = System.currentTimeMillis();
 
-        checkPair(1, 2, levels, actions);
-        checkPair(1, 3, levels, actions);
-        checkPair(2, 3, levels, actions);
+        checkPair(1, 2, levels, actions, now);
+        checkPair(1, 3, levels, actions, now);
+        checkPair(2, 3, levels, actions, now);
 
         if (!actions.isEmpty()) {
             String commandId = UUID.randomUUID().toString();
@@ -58,7 +73,8 @@ public class BalanceEngine {
         wsHandler.broadcastPumpStatus(pumpStates);
     }
 
-    private void checkPair(int wellA, int wellB, Map<Integer, Integer> levels, List<Map<String, Object>> actions) {
+    private void checkPair(int wellA, int wellB, Map<Integer, Integer> levels,
+                           List<Map<String, Object>> actions, long now) {
         Integer levelA = levels.get(wellA);
         Integer levelB = levels.get(wellB);
         if (levelA == null || levelB == null) return;
@@ -66,60 +82,95 @@ public class BalanceEngine {
         String valveKey = Math.min(wellA, wellB) + "-" + Math.max(wellA, wellB);
         int diff = levelA - levelB;
 
-        if (diff > diffThreshold || (levelA > highThreshold && levelB < lowThreshold)) {
-            int highWell = wellA;
-            int lowWell = wellB;
-            String vk = Math.min(highWell, lowWell) + "-" + Math.max(highWell, lowWell);
+        boolean shouldOpenValve = (diff > diffThreshold) || (levelA > highThreshold && levelB < lowThreshold);
+        boolean shouldCloseValve = Math.abs(diff) <= diffThreshold / 2;
 
-            if (!valveStates.getOrDefault(vk, false)) {
+        int highWell = diff > 0 ? wellA : wellB;
+        int lowWell = diff > 0 ? wellB : wellA;
+
+        if (shouldOpenValve) {
+            valveOpenStreak.merge(valveKey, 1, Integer::sum);
+            valveCloseStreak.put(valveKey, 0);
+
+            boolean currentState = valveStates.getOrDefault(valveKey, false);
+            long lastAction = lastValveActionTime.getOrDefault(valveKey, 0L);
+            boolean cooldownOk = (now - lastAction) >= minActionIntervalMs;
+
+            if (!currentState && valveOpenStreak.get(valveKey) >= stableCountRequired && cooldownOk) {
                 actions.add(Map.of(
                         "type", "valve",
                         "well_a", highWell,
                         "well_b", lowWell,
                         "open", true
                 ));
-                valveStates.put(vk, true);
-                log.info("井 {} 水位 {}cm 过高，井 {} 水位 {}cm 偏低，开启 {} 连通阀",
-                        highWell, levelA, lowWell, levelB, vk);
+                valveStates.put(valveKey, true);
+                lastValveActionTime.put(valveKey, now);
+                log.info("趋势稳定后开启 {} 连通阀: streak={}, A={}cm, B={}cm",
+                        valveKey, valveOpenStreak.get(valveKey), levelA, levelB);
             }
 
-            if (!pumpStates.getOrDefault(highWell, false)) {
-                actions.add(Map.of(
-                        "type", "pump",
-                        "well_id", highWell,
-                        "running", true
-                ));
-                pumpStates.put(highWell, true);
-                log.info("井 {} 抽水泵开启低功耗运转", highWell);
-            }
-        } else if (Math.abs(diff) <= diffThreshold / 2) {
-            String vk = Math.min(wellA, wellB) + "-" + Math.max(wellA, wellB);
-            if (valveStates.getOrDefault(vk, false)) {
+            handlePump(highWell, true, actions, now);
+        } else if (shouldCloseValve) {
+            valveCloseStreak.merge(valveKey, 1, Integer::sum);
+            valveOpenStreak.put(valveKey, 0);
+
+            boolean currentState = valveStates.getOrDefault(valveKey, false);
+            long lastAction = lastValveActionTime.getOrDefault(valveKey, 0L);
+            boolean cooldownOk = (now - lastAction) >= minActionIntervalMs;
+
+            if (currentState && valveCloseStreak.get(valveKey) >= stableCountRequired && cooldownOk) {
                 actions.add(Map.of(
                         "type", "valve",
                         "well_a", wellA,
                         "well_b", wellB,
                         "open", false
                 ));
-                valveStates.put(vk, false);
-                log.info("井 {}-{} 水位已配平，关闭连通阀", wellA, wellB);
+                valveStates.put(valveKey, false);
+                lastValveActionTime.put(valveKey, now);
+                log.info("水位稳定配平后关闭 {} 连通阀: streak={}",
+                        valveKey, valveCloseStreak.get(valveKey));
+            }
+        } else {
+            valveOpenStreak.put(valveKey, 0);
+            valveCloseStreak.put(valveKey, 0);
+        }
+
+        if (levelA <= highThreshold && pumpStates.getOrDefault(wellA, false)) {
+            handlePump(wellA, false, actions, now);
+        }
+        if (levelB <= highThreshold && pumpStates.getOrDefault(wellB, false)) {
+            handlePump(wellB, false, actions, now);
+        }
+    }
+
+    private void handlePump(int wellId, boolean shouldRun,
+                            List<Map<String, Object>> actions, long now) {
+        boolean currentState = pumpStates.getOrDefault(wellId, false);
+        long lastAction = lastPumpActionTime.getOrDefault(wellId, 0L);
+        boolean cooldownOk = (now - lastAction) >= minActionIntervalMs;
+
+        if (shouldRun != currentState && cooldownOk) {
+            int streakKey = shouldRun ? pumpOnStreak.merge(wellId, 1, Integer::sum)
+                    : pumpOffStreak.merge(wellId, 1, Integer::sum);
+
+            if (shouldRun) {
+                pumpOffStreak.put(wellId, 0);
+            } else {
+                pumpOnStreak.put(wellId, 0);
             }
 
-            if (levelA <= highThreshold && pumpStates.getOrDefault(wellA, false)) {
+            int streak = shouldRun ? pumpOnStreak.getOrDefault(wellId, 0)
+                    : pumpOffStreak.getOrDefault(wellId, 0);
+
+            if (streak >= stableCountRequired) {
                 actions.add(Map.of(
                         "type", "pump",
-                        "well_id", wellA,
-                        "running", false
+                        "well_id", wellId,
+                        "running", shouldRun
                 ));
-                pumpStates.put(wellA, false);
-            }
-            if (levelB <= highThreshold && pumpStates.getOrDefault(wellB, false)) {
-                actions.add(Map.of(
-                        "type", "pump",
-                        "well_id", wellB,
-                        "running", false
-                ));
-                pumpStates.put(wellB, false);
+                pumpStates.put(wellId, shouldRun);
+                lastPumpActionTime.put(wellId, now);
+                log.info("井 {} 抽水泵 {}: streak={}", wellId, shouldRun ? "开启" : "关闭", streak);
             }
         }
     }

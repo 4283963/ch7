@@ -20,19 +20,24 @@ public class WaterLevelService {
     private final WaterLevelRepository repository;
     private final BalanceEngine balanceEngine;
     private final DashboardWebSocketHandler wsHandler;
+    private final WaterLevelFilter waterLevelFilter;
 
     public WaterLevelService(WaterLevelRepository repository,
                              BalanceEngine balanceEngine,
-                             DashboardWebSocketHandler wsHandler) {
+                             DashboardWebSocketHandler wsHandler,
+                             WaterLevelFilter waterLevelFilter) {
         this.repository = repository;
         this.balanceEngine = balanceEngine;
         this.wsHandler = wsHandler;
+        this.waterLevelFilter = waterLevelFilter;
     }
 
-    public void processWaterLevels(Map<Integer, Integer> levels) {
+    public void processWaterLevels(Map<Integer, Integer> rawLevels) {
         Instant now = Instant.now();
 
-        for (Map.Entry<Integer, Integer> entry : levels.entrySet()) {
+        Map<Integer, Integer> filteredLevels = waterLevelFilter.filterAll(rawLevels);
+
+        for (Map.Entry<Integer, Integer> entry : rawLevels.entrySet()) {
             if (entry.getValue() < 0) continue;
 
             WaterLevelRecord record = new WaterLevelRecord(entry.getKey(), entry.getValue(), now);
@@ -40,8 +45,8 @@ public class WaterLevelService {
             log.debug("保存水位: 井{} = {}cm", entry.getKey(), entry.getValue());
         }
 
-        wsHandler.broadcastWaterLevels(levels);
-        balanceEngine.evaluate(levels);
+        wsHandler.broadcastWaterLevels(filteredLevels);
+        balanceEngine.evaluate(filteredLevels);
     }
 
     public Map<Integer, Integer> getLatestLevels() {

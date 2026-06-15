@@ -23,7 +23,13 @@ balance:
   high-threshold: 450
   low-threshold: 150
   diff-threshold: 200
-  check-interval-ms: 3000
+  min-action-interval-ms: 10000
+  stable-count: 3
+
+filter:
+  window-size: 7
+  ema-alpha: 0.3
+  max-spike-cm: 150
 
 server:
   port: 8080

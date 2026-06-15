@@ -17,7 +17,7 @@
             :height="canvasSize.height"
           ></canvas>
           <div class="well-info">
-            <span class="level-text">水位: {{ well.level }} cm</span>
+            <span class="level-text">水位: {{ displayLevels[well.id] }} cm</span>
             <span class="pump-badge" :class="pumpClass(well.id)">
               💧 抽水泵 {{ pumpStates[well.id] ? '运转中' : '待机' }}
             </span>
@@ -45,17 +45,26 @@ import dashboardWs from '../utils/websocket.js'
 const MAX_LEVEL = 600
 const canvasSize = { width: 220, height: 400 }
 
+const LERP_SPEED = 0.08
+const DISPLAY_THROTTLE_MS = 200
+
 const wells = reactive([
-  { id: 1, name: '1 号深井', level: 0 },
-  { id: 2, name: '2 号深井', level: 0 },
-  { id: 3, name: '3 号深井', level: 0 },
+  { id: 1, name: '1 号深井' },
+  { id: 2, name: '2 号深井' },
+  { id: 3, name: '3 号深井' },
 ])
+
+const targetLevels = reactive({ 1: 0, 2: 0, 3: 0 })
+const currentLevels = { 1: 0, 2: 0, 3: 0 }
+const displayLevels = reactive({ 1: 0, 2: 0, 3: 0 })
 
 const pumpStates = reactive({ 1: false, 2: false, 3: false })
 const valveStates = reactive({ '1-2': false, '1-3': false, '2-3': false })
 const wsConnected = ref(false)
 
 const canvasRefs = {}
+
+let lastDisplayUpdate = 0
 
 function setCanvasRef(wellId, el) {
   if (el) canvasRefs[wellId] = el
@@ -74,8 +83,6 @@ function drawWell(wellId) {
   const ctx = canvas.getContext('2d')
   const w = canvas.width
   const h = canvas.height
-  const well = wells.find(w => w.id === wellId)
-  if (!well) return
 
   ctx.clearRect(0, 0, w, h)
 
@@ -89,15 +96,16 @@ function drawWell(wellId) {
   ctx.lineWidth = 2
   ctx.strokeRect(barX, barY, barW, barH)
 
-  const levelRatio = Math.min(well.level / MAX_LEVEL, 1)
+  const level = currentLevels[wellId] || 0
+  const levelRatio = Math.min(level / MAX_LEVEL, 1)
   const waterH = barH * levelRatio
 
   let gradient
-  if (well.level > 450) {
+  if (level > 450) {
     gradient = ctx.createLinearGradient(0, barY + barH - waterH, 0, barY + barH)
     gradient.addColorStop(0, '#ff4444')
     gradient.addColorStop(1, '#cc0000')
-  } else if (well.level > 300) {
+  } else if (level > 300) {
     gradient = ctx.createLinearGradient(0, barY + barH - waterH, 0, barY + barH)
     gradient.addColorStop(0, '#ffaa00')
     gradient.addColorStop(1, '#ff6600')
@@ -111,15 +119,15 @@ function drawWell(wellId) {
   ctx.fillRect(barX + 1, barY + barH - waterH, barW - 2, waterH)
 
   const now = Date.now() / 1000
-  for (let i = 0; i < 3; i++) {
-    const waveY = barY + barH - waterH + Math.sin(now * 2 + i * 2) * 3
+  for (let i = 0; i < 2; i++) {
+    const waveY = barY + barH - waterH + Math.sin(now * 1.5 + i * 2) * 3
     ctx.beginPath()
     ctx.moveTo(barX + 1, waveY)
-    for (let x = barX + 1; x < barX + barW - 1; x += 4) {
-      const wy = waveY + Math.sin((x - barX) * 0.05 + now * 3 + i) * 2
+    for (let x = barX + 1; x < barX + barW - 1; x += 6) {
+      const wy = waveY + Math.sin((x - barX) * 0.04 + now * 2 + i) * 2
       ctx.lineTo(x, wy)
     }
-    ctx.strokeStyle = 'rgba(255,255,255,0.15)'
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)'
     ctx.lineWidth = 1
     ctx.stroke()
   }
@@ -141,7 +149,7 @@ function drawWell(wellId) {
   ctx.fillStyle = '#ffffff'
   ctx.font = 'bold 20px sans-serif'
   ctx.textAlign = 'center'
-  ctx.fillText(well.level + ' cm', w / 2, barY + barH + 40)
+  ctx.fillText(Math.round(level) + ' cm', w / 2, barY + barH + 40)
 
   if (pumpStates[wellId]) {
     ctx.fillStyle = '#00ff88'
@@ -153,15 +161,35 @@ function drawWell(wellId) {
 let animFrameId = null
 
 function animate() {
-  wells.forEach(w => drawWell(w.id))
+  for (const wellId of [1, 2, 3]) {
+    const target = targetLevels[wellId] || 0
+    const current = currentLevels[wellId] || 0
+    const diff = target - current
+
+    if (Math.abs(diff) > 0.1) {
+      currentLevels[wellId] = current + diff * LERP_SPEED
+    } else {
+      currentLevels[wellId] = target
+    }
+
+    drawWell(wellId)
+  }
+
+  const now = Date.now()
+  if (now - lastDisplayUpdate >= DISPLAY_THROTTLE_MS) {
+    lastDisplayUpdate = now
+    for (const wellId of [1, 2, 3]) {
+      displayLevels[wellId] = Math.round(currentLevels[wellId])
+    }
+  }
+
   animFrameId = requestAnimationFrame(animate)
 }
 
 function handleWaterLevel(data) {
   wsConnected.value = true
   for (const [id, level] of Object.entries(data)) {
-    const well = wells.find(w => w.id === Number(id))
-    if (well) well.level = level
+    targetLevels[Number(id)] = level
   }
 }
 
@@ -188,8 +216,10 @@ onMounted(async () => {
     if (resp.ok) {
       const data = await resp.json()
       for (const [id, level] of Object.entries(data)) {
-        const well = wells.find(w => w.id === Number(id))
-        if (well) well.level = level
+        const wellId = Number(id)
+        targetLevels[wellId] = level
+        currentLevels[wellId] = level
+        displayLevels[wellId] = level
       }
     }
   } catch (e) {
